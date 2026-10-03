@@ -197,12 +197,14 @@ async def recommend(req: RecommendRequest):
         active_user_series = pd.Series(user_ratings, name=active_user_id)
         utility_matrix = pd.concat([utility_matrix, active_user_series.to_frame().T])
         
-        # 4. Fill NaNs with 0 (Standard Cosine Similarity to avoid zero-variance collapse)
-        centered_matrix = utility_matrix.fillna(0).astype(float)
+        # 4. Compute User Means and Mean-Center the Matrix (Pearson Correlation)
+        user_means = utility_matrix.mean(axis=1)
+        centered_matrix = utility_matrix.sub(user_means, axis=0)
+        filled_matrix = centered_matrix.fillna(0).astype(float)
         
-        # 5. Compute Cosine Similarity (Vectorized NumPy)
-        active_vector = centered_matrix.loc[active_user_id].values
-        other_users_matrix = centered_matrix.drop(active_user_id)
+        # 5. Compute Pearson Similarity (Vectorized NumPy)
+        active_vector = filled_matrix.loc[active_user_id].values
+        other_users_matrix = filled_matrix.drop(active_user_id)
         other_vectors = other_users_matrix.values
         
         dot_products = np.dot(other_vectors, active_vector)
@@ -225,15 +227,26 @@ async def recommend(req: RecommendRequest):
         unplayed_valid_games = [gid for gid in valid_game_ids if gid not in user_ratings]
         predictions = []
         
+        active_user_mean = user_means.loc[active_user_id]
+        
         for gid in unplayed_valid_games:
             if gid not in utility_matrix.columns:
                 continue
+                
             top_5_ratings = utility_matrix.loc[top_5_users.index, gid].dropna()
-            if top_5_ratings.empty:
+            
+            # Minimum support threshold: must be rated by at least 2 similar users
+            if len(top_5_ratings) < 2:
                 continue
                 
             valid_sims = top_5_users.loc[top_5_ratings.index]
-            predicted_rating = np.dot(valid_sims, top_5_ratings) / valid_sims.sum()
+            valid_other_means = user_means.loc[top_5_ratings.index]
+            
+            # Prediction = User_Mean + [ Sum(Sim * (Other_Rating - Other_Mean)) / Sum(|Sim|) ]
+            rating_diff = top_5_ratings - valid_other_means
+            weighted_diff = np.dot(valid_sims, rating_diff) / np.abs(valid_sims).sum()
+            predicted_rating = active_user_mean + weighted_diff
+            
             predictions.append({'game_id': gid, 'predicted_rating': predicted_rating})
             
         if not predictions:
