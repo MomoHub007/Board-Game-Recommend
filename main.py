@@ -186,73 +186,156 @@ async def recommend(req: RecommendRequest):
         valid_games = games_df[(games_df['min_players'] <= req.player_count) & (games_df['max_players'] >= req.player_count)]
         valid_game_ids = valid_games['game_id'].unique()
         
-        # 2. Build Utility Matrix
-        relevant_game_ids = set(valid_game_ids).union(user_ratings.keys())
-        filtered_ratings = ratings_df[ratings_df['game_id'].isin(relevant_game_ids)]
-        
-        utility_matrix = filtered_ratings.pivot_table(index='user_id', columns='game_id', values='rating', aggfunc='mean')
-        
-        # 3. Append Active User
-        active_user_id = 'ACTIVE_USER'
-        active_user_series = pd.Series(user_ratings, name=active_user_id)
-        utility_matrix = pd.concat([utility_matrix, active_user_series.to_frame().T])
-        
-        # 4. Compute User Means and Mean-Center the Matrix (Pearson Correlation)
-        user_means = utility_matrix.mean(axis=1)
-        centered_matrix = utility_matrix.sub(user_means, axis=0)
-        filled_matrix = centered_matrix.fillna(0).astype(float)
-        
-        # 5. Compute Pearson Similarity (Vectorized NumPy)
-        active_vector = filled_matrix.loc[active_user_id].values
-        other_users_matrix = filled_matrix.drop(active_user_id)
-        other_vectors = other_users_matrix.values
-        
-        dot_products = np.dot(other_vectors, active_vector)
-        norm_active = np.linalg.norm(active_vector)
-        norms_others = np.linalg.norm(other_vectors, axis=1)
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            similarities = dot_products / (norm_active * norms_others)
-            similarities = np.nan_to_num(similarities, nan=0.0)
-            
-        sim_series = pd.Series(similarities, index=other_users_matrix.index)
-        
-        # 6. Find Neighborhood N
-        top_5_users = sim_series[sim_series > 0].nlargest(5)
-        
-        if top_5_users.empty:
-            raise HTTPException(status_code=404, detail="Neighborhood is empty. Try rating more games or different games.")
-            
-        # 7. Predict Unplayed Games
-        unplayed_valid_games = [gid for gid in valid_game_ids if gid not in user_ratings]
         predictions = []
+        proof_out = []
+        is_personalized = True
         
-        active_user_mean = user_means.loc[active_user_id]
-        
-        for gid in unplayed_valid_games:
-            if gid not in utility_matrix.columns:
-                continue
+        try:
+            if len(user_ratings) == 1:
+                # --- FALLBACK LOGIC (For 1 rating) ---
+                single_gid, single_rating = list(user_ratings.items())[0]
                 
-            top_5_ratings = utility_matrix.loc[top_5_users.index, gid].dropna()
-            
-            # Minimum support threshold: must be rated by at least 2 similar users
-            if len(top_5_ratings) < 2:
-                continue
+                # Find users who rated this game within +/- 1.5 points
+                similar_users_df = ratings_df[
+                    (ratings_df['game_id'] == single_gid) & 
+                    (ratings_df['rating'] >= single_rating - 1.5) & 
+                    (ratings_df['rating'] <= single_rating + 1.5)
+                ]
                 
-            valid_sims = top_5_users.loc[top_5_ratings.index]
-            valid_other_means = user_means.loc[top_5_ratings.index]
+                similar_user_ids = similar_users_df['user_id'].unique()
+                
+                if len(similar_user_ids) == 0:
+                    raise ValueError("Not enough data from similar users for this game.")
+                    
+                # Get all ratings from these similar users
+                cohort_ratings = ratings_df[ratings_df['user_id'].isin(similar_user_ids)]
+                
+                # Filter valid games and exclude the inputted game
+                cohort_ratings = cohort_ratings[
+                    (cohort_ratings['game_id'].isin(valid_game_ids)) & 
+                    (cohort_ratings['game_id'] != single_gid)
+                ]
+                
+                # Calculate average rating for these games
+                game_stats = cohort_ratings.groupby('game_id')['rating'].agg(['mean', 'count'])
+                game_stats = game_stats[game_stats['count'] >= 2]  # Minimum support
+                
+                if game_stats.empty:
+                    raise ValueError("Neighborhood is empty. Try rating more games.")
+                    
+                for gid, row in game_stats.iterrows():
+                    predictions.append({'game_id': gid, 'predicted_rating': row['mean']})
+                    
+                # Create proof out from similar users
+                top_cohort_users = similar_users_df.head(5)
+                for _, row in top_cohort_users.iterrows():
+                    proof_out.append({"user_id": str(row['user_id']), "similarity_score": 1.0})
+                    
+            else:
+                # --- PRIMARY LOGIC (For > 1 ratings) ---
+                # 2. Build Utility Matrix
+                relevant_game_ids = set(valid_game_ids).union(user_ratings.keys())
+                filtered_ratings = ratings_df[ratings_df['game_id'].isin(relevant_game_ids)]
+                
+                utility_matrix = filtered_ratings.pivot_table(index='user_id', columns='game_id', values='rating', aggfunc='mean')
+                
+                # 3. Append Active User
+                active_user_id = 'ACTIVE_USER'
+                active_user_series = pd.Series(user_ratings, name=active_user_id)
+                utility_matrix = pd.concat([utility_matrix, active_user_series.to_frame().T])
+                
+                # 4. Compute User Means and Mean-Center the Matrix (Pearson Correlation)
+                user_means = utility_matrix.mean(axis=1)
+                centered_matrix = utility_matrix.sub(user_means, axis=0)
+                filled_matrix = centered_matrix.fillna(0).astype(float)
+                
+                # 5. Compute Pearson Similarity (Vectorized NumPy)
+                active_vector = filled_matrix.loc[active_user_id].values
+                other_users_matrix = filled_matrix.drop(active_user_id)
+                other_vectors = other_users_matrix.values
+                
+                dot_products = np.dot(other_vectors, active_vector)
+                norm_active = np.linalg.norm(active_vector)
+                norms_others = np.linalg.norm(other_vectors, axis=1)
+                
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    similarities = dot_products / (norm_active * norms_others)
+                    similarities = np.nan_to_num(similarities, nan=0.0)
+                    
+                sim_series = pd.Series(similarities, index=other_users_matrix.index)
+                
+                # 6. Find Neighborhood N
+                top_5_users = sim_series[sim_series > 0].nlargest(5)
+                
+                if top_5_users.empty:
+                    raise ValueError("Neighborhood is empty. Try rating more games or different games.")
+                    
+                # 7. Predict Unplayed Games
+                unplayed_valid_games = [gid for gid in valid_game_ids if gid not in user_ratings]
+                
+                active_user_mean = user_means.loc[active_user_id]
+                
+                for gid in unplayed_valid_games:
+                    if gid not in utility_matrix.columns:
+                        continue
+                        
+                    top_5_ratings = utility_matrix.loc[top_5_users.index, gid].dropna()
+                    
+                    # Minimum support threshold: must be rated by at least 2 similar users
+                    if len(top_5_ratings) < 2:
+                        continue
+                        
+                    valid_sims = top_5_users.loc[top_5_ratings.index]
+                    valid_other_means = user_means.loc[top_5_ratings.index]
+                    
+                    # Prediction = User_Mean + [ Sum(Sim * (Other_Rating - Other_Mean)) / Sum(|Sim|) ]
+                    rating_diff = top_5_ratings - valid_other_means
+                    weighted_diff = np.dot(valid_sims, rating_diff) / np.abs(valid_sims).sum()
+                    predicted_rating = active_user_mean + weighted_diff
+                    
+                    predictions.append({'game_id': gid, 'predicted_rating': predicted_rating})
+                    
+                proof_out = [{"user_id": str(uid), "similarity_score": float(round(sim, 4))} for uid, sim in top_5_users.items()]
+
+            if not predictions:
+                raise ValueError("Insufficient neighbor data to predict valid games.")
+                
+        except ValueError as ve:
+            print(f"Personalized fallback triggered: {ve}")
+            is_personalized = False
+            predictions = []
+
+        if not is_personalized or not predictions:
+            # --- GLOBAL BASELINE FALLBACK ---
+            is_personalized = False
+            unplayed_global_games = games_df[
+                (~games_df['game_id'].isin(user_ratings.keys())) &
+                (games_df['min_players'] <= req.player_count) & 
+                (games_df['max_players'] >= req.player_count)
+            ]
             
-            # Prediction = User_Mean + [ Sum(Sim * (Other_Rating - Other_Mean)) / Sum(|Sim|) ]
-            rating_diff = top_5_ratings - valid_other_means
-            weighted_diff = np.dot(valid_sims, rating_diff) / np.abs(valid_sims).sum()
-            predicted_rating = active_user_mean + weighted_diff
+            sort_col = 'bayesaverage' if 'bayesaverage' in unplayed_global_games.columns else 'usersrated'
+            if sort_col in unplayed_global_games.columns:
+                top_global = unplayed_global_games.sort_values(sort_col, ascending=False).head(10)
+            else:
+                top_global = unplayed_global_games.head(10)
+                
+            recommendations_out = []
+            for row in top_global.itertuples():
+                val = getattr(row, sort_col, 0.0) if hasattr(row, sort_col) else 0.0
+                recommendations_out.append({
+                    "name": str(getattr(row, 'name', 'Unknown')),
+                    "predicted_rating": float(round(val, 2)),
+                    "image": str(getattr(row, 'image', 'https://via.placeholder.com/400x400/1e293b/ffffff?text=No+Cover'))
+                })
             
-            predictions.append({'game_id': gid, 'predicted_rating': predicted_rating})
+            return {
+                "recommendations": recommendations_out,
+                "proof": [{"user_id": "GLOBAL_BASELINE", "similarity_score": 1.0}],
+                "is_personalized": False
+            }
             
-        if not predictions:
-            raise HTTPException(status_code=404, detail="Insufficient neighbor data to predict valid games.")
-            
-        # 8. Extract Top 3 and Return
+        # 8. Extract Top 3 and Return (Personalized)
         predictions_df = pd.DataFrame(predictions).nlargest(3, 'predicted_rating')
         
         recommendations_out = []
@@ -264,11 +347,10 @@ async def recommend(req: RecommendRequest):
                 "image": str(g_info['image'])
             })
             
-        proof_out = [{"user_id": str(uid), "similarity_score": float(round(sim, 4))} for uid, sim in top_5_users.items()]
-        
         return {
             "recommendations": recommendations_out,
-            "proof": proof_out
+            "proof": proof_out,
+            "is_personalized": True
         }
         
     except HTTPException:
